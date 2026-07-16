@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-cli-assistant"
+version = "0.1.0"
+description = "A multi-model, MCP-aware, tool-calling AI assistant for your terminal."
+requires-python = ">=3.9"
+dependencies = [
+    "rich>=13.0",
+    "pyyaml>=6.0",
+    "requests>=2.31",
+    "anthropic>=0.40",
+    "openai>=1.40",
+]
+
+[project.scripts]
+ai = "ai_cli.cli:main"
+
+[tool.setuptools]
+packages = ["ai_cli", "ai_cli.providers", "ai_cli.mcp", "ai_cli.tools", "ai_cli.bots"]
