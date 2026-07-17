@@ -1,0 +1,3 @@
+# Discord support is now included directly in requirements.txt.
+# This file is kept only so older setup steps that referenced it don't
+# break; there's nothing extra to install here anymore.
