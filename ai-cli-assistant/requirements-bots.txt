@@ -1,4 +1,0 @@
-# Only needed if you're running the Discord bot (`ai bots run discord`).
-# The Telegram bot uses plain `requests`, already in requirements.txt, so it
-# needs nothing extra.
-discord.py>=2.3,<3
