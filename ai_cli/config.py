@@ -22,6 +22,29 @@ CONFIG_PATH = APP_DIR / "config.yaml"
 MCP_SERVERS_PATH = APP_DIR / "mcp_servers.json"
 SESSIONS_DIR = APP_DIR / "sessions"
 
+# Placeholder paths that ship in the example config — replaced at load
+# time with sensible defaults so MCP servers work out of the box.
+_PLACEHOLDER_PATHS = {
+    "/path/to/allowed/dir",
+    "/path/to/git/repo",
+    "/path/to/database.db",
+    "/path/to/project",
+}
+
+
+def _resolve_placeholder_path(raw: str) -> str:
+    """Replace placeholder paths with a sensible real default."""
+    stripped = raw.strip()
+    if stripped in _PLACEHOLDER_PATHS or not stripped:
+        # Default to the project root (parent of the ai_cli package).
+        try:
+            project_root = Path(__file__).resolve().parent.parent
+            return str(project_root)
+        except Exception:
+            return str(Path.cwd())
+    return stripped
+
+
 DEFAULT_CONFIG: Dict[str, Any] = {
     "default_model": "claude-sonnet-5",
     "default_system_prompt": (
@@ -157,6 +180,14 @@ class MCPServerConfig:
 
 
 def load_mcp_servers(path: Optional[Path] = None) -> List[MCPServerConfig]:
+    """
+    Load MCP server configs from *path* (default: ~/.ai-cli/mcp_servers.json).
+
+    Any argument that looks like a placeholder path (``/path/to/...``) is
+    automatically replaced with the project root so that shipped example
+    configs work out of the box instead of failing with a directory-access
+    error on the MCP server's init.
+    """
     servers_path = path or MCP_SERVERS_PATH
     if not servers_path.exists():
         return []
@@ -164,11 +195,20 @@ def load_mcp_servers(path: Optional[Path] = None) -> List[MCPServerConfig]:
         data = json.load(f)
     servers = []
     for name, spec in (data.get("mcpServers") or {}).items():
+        raw_args = spec.get("args", [])
+        # Auto-resolve placeholder paths so the filesystem / git / sqlite
+        # MCP servers don't crash on init with a bad directory.
+        resolved_args = []
+        for arg in raw_args:
+            if isinstance(arg, str) and (arg.startswith("/path/to/") or arg in _PLACEHOLDER_PATHS):
+                resolved_args.append(_resolve_placeholder_path(arg))
+            else:
+                resolved_args.append(arg)
         servers.append(
             MCPServerConfig(
                 name=name,
                 command=spec["command"],
-                args=spec.get("args", []),
+                args=resolved_args,
                 env=spec.get("env", {}),
             )
         )

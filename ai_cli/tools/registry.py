@@ -26,9 +26,16 @@ class ToolRegistry:
         confirm_before_write: bool,
         confirm_before_shell: bool,
         confirm_fn: Callable[[str], bool],
+        allowed_shell_commands: Optional[List[str]] = None,
     ) -> None:
         for spec, handler in make_builtin_tools(
-            enable_filesystem, enable_shell, enable_http, confirm_before_write, confirm_before_shell, confirm_fn
+            enable_filesystem,
+            enable_shell,
+            enable_http,
+            confirm_before_write,
+            confirm_before_shell,
+            confirm_fn,
+            allowed_shell_commands=allowed_shell_commands,
         ):
             self._local[spec.name] = (spec, handler)
 

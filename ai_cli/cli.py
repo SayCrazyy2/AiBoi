@@ -32,6 +32,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "Also available:\n"
             "  ai setup                run the interactive setup wizard\n"
             "  ai bots setup|run ...   configure and run Telegram/Discord bots\n"
+            "  ai mcp list|add|remove   manage MCP servers\n"
             "  ai serve                production entrypoint (Railway/Docker/systemd)\n"
             "See README.md for details."
         ),
@@ -60,10 +61,8 @@ def main(argv=None) -> int:
     # load it before anything looks up an environment variable.
     cfgmod.load_env_file()
 
-    # "ai bots ..." and "ai setup" are separate mini command-lines, handled
-    # before argparse ever sees them (argparse's single positional `prompt`
-    # would otherwise happily swallow "bots run telegram" as a literal
-    # one-shot prompt).
+    # "ai bots ...", "ai setup", "ai serve", and "ai mcp ..." are separate
+    # mini command-lines, handled before argparse ever sees them.
     if argv and argv[0] == "bots":
         return _handle_bots(console, argv[1:])
     if argv and argv[0] == "setup":
@@ -73,6 +72,10 @@ def main(argv=None) -> int:
         return 0
     if argv and argv[0] == "serve":
         return _cmd_serve(console)
+    if argv and argv[0] == "mcp":
+        from .mcp_tool import handle_mcp
+
+        return handle_mcp(console, argv[1:])
 
     args = build_arg_parser().parse_args(argv)
 
@@ -82,6 +85,7 @@ def main(argv=None) -> int:
         console.print(f"  edit {cfgmod.CONFIG_PATH} for models/tool settings")
         console.print(f"  edit {cfgmod.MCP_SERVERS_PATH} to add MCP servers")
         console.print("  or run `ai --setup` for a guided walkthrough instead")
+        console.print("  or run `ai mcp list` to browse and add MCP servers")
         return 0
 
     if args.setup:

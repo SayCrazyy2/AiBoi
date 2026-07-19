@@ -68,6 +68,7 @@ class Session:
             tool_results = []
             for tu in tool_uses:
                 on_tool_call(tu["name"], tu["input"])
+                t0 = time.monotonic()
                 try:
                     output = self.tools.call(tu["name"], tu["input"])
                     is_error = False
@@ -77,9 +78,16 @@ class Session:
                 except Exception as e:  # noqa: BLE001
                     output = f"Unexpected error: {e}"
                     is_error = True
+                duration = time.monotonic() - t0
                 on_tool_result(tu["name"], output, is_error)
                 tool_results.append(
-                    {"type": "tool_result", "tool_use_id": tu["id"], "content": output, "is_error": is_error}
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tu["id"],
+                        "content": output,
+                        "is_error": is_error,
+                        "duration": round(duration, 3),
+                    }
                 )
             self.messages.append({"role": "user", "content": tool_results})
 

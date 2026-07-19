@@ -1,0 +1,327 @@
+"""
+The brains shared by every bot frontend. Telegram and Discord each get a
+thin transport layer (polling vs. gateway, their own message-length limits,
+their own way of saying "who sent this") that both funnel into BotEngine,
+so the command set and the tool-calling loop only exist once.
+"""
+
+from __future__ import annotations
+import time
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Optional
+
+from .. import config as cfgmod
+from ..mcp.manager import MCPManager
+from ..providers import ProviderError, build_provider
+from ..session import Session
+from ..tools.registry import ToolRegistry
+
+HELP_TEXT = (
+    "Here's what I can do:\n"
+    "/help - show this message\n"
+    "/reset - clear this chat's conversation history\n"
+    "/model [name] - show or switch the model (owner only to change)\n"
+    "/system [prompt] - show or set the system prompt for this chat (owner only to change)\n"
+    "/tools - list available tools\n"
+    "/usage - token usage for this chat\n"
+    "/whoami - show your user id and this chat's id\n"
+    "\n"
+    "Anything else you send is just a normal message to the assistant."
+)
+
+
+# -- tool-call log -----------------------------------------------------------
+
+
+@dataclass
+class ToolCallRecord:
+    """One tool invocation during a turn, for logging in the bot message."""
+    name: str
+    args: dict
+    result: str
+    is_error: bool
+    duration: float
+
+
+@dataclass
+class TurnLog:
+    """Everything that happened during one AI turn."""
+    tool_calls: List[ToolCallRecord] = field(default_factory=list)
+    started_at: float = field(default_factory=time.time)
+    finished_at: Optional[float] = None
+
+    def add_call(self, name: str, args: dict, result: str, is_error: bool, duration: float) -> None:
+        self.tool_calls.append(
+            ToolCallRecord(name=name, args=args, result=result, is_error=is_error, duration=duration)
+        )
+
+    @property
+    def elapsed(self) -> float:
+        end = self.finished_at or time.time()
+        return end - self.started_at
+
+    def format_log(self) -> str:
+        """
+        Renders the tool-call log as a clean footer block for the bot message.
+
+        Format (Telegram Rich Markdown):
+
+        ---
+
+        > **🔧 Tool Calls** · 2 calls · 4.1s
+        >
+        > **`list_directory`** ✅ `0.03s`
+        > `path: "."`
+        > ```
+        > .git .venv ai_cli ...
+        > ```
+        >
+        > **`calculator`** ✅ `0.05s`
+        > `expression: "17 * 23 + 456 / 12"`
+        > ```
+        > 442.0
+        > ```
+        """
+        if not self.tool_calls:
+            return ""
+
+        lines: List[str] = []
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+
+        # Header line
+        total_elapsed = self.elapsed
+        lines.append(f"> **🔧 Tool Calls** · {len(self.tool_calls)} call{'s' if len(self.tool_calls) != 1 else ''} · {total_elapsed:.1f}s")
+        lines.append(">")
+
+        for tc in self.tool_calls:
+            status = "❌" if tc.is_error else "✅"
+            dur_str = f"{tc.duration:.2f}s" if tc.duration < 10 else f"{tc.duration:.1f}s"
+
+            # Tool name + status + duration on one line
+            lines.append(f"> **`{tc.name}`** {status} `{dur_str}`")
+
+            # Args (each key-value on its own line, truncated)
+            if tc.args:
+                for k, v in tc.args.items():
+                    v_str = str(v)
+                    if len(v_str) > 80:
+                        v_str = v_str[:79] + "…"
+                    lines.append(f"> `{k}: {v_str}`")
+
+            # Result in a code block (truncated)
+            result_str = tc.result.strip() if tc.result else ""
+            if tc.is_error:
+                result_str = _truncate(result_str, 300)
+            else:
+                result_str = _truncate(result_str, 150)
+
+            if result_str:
+                # Use a fenced code block inside the blockquote
+                lines.append("> ```")
+                for rline in result_str.split("\n")[:5]:
+                    lines.append(f"> {rline}")
+                lines.append("> ```")
+
+            lines.append(">")
+
+        # MCP server breakdown
+        mcp_calls = [tc for tc in self.tool_calls if tc.name.startswith("mcp__")]
+        if mcp_calls:
+            servers_used: Dict[str, int] = {}
+            for tc in mcp_calls:
+                parts = tc.name.split("__")
+                if len(parts) >= 2:
+                    srv = parts[1]
+                    servers_used[srv] = servers_used.get(srv, 0) + 1
+            if servers_used:
+                srv_summary = ", ".join(f"{k} ({v})" for k, v in servers_used.items())
+                lines.append(f"> 📦 MCP: {srv_summary}")
+
+        return "\n".join(lines)
+
+
+def _truncate(text: str, max_len: int) -> str:
+    if len(text) <= max_len:
+        return text
+    return text[:max_len - 1] + "…"
+
+
+def _format_args(args: dict) -> str:
+    """Compact one-line representation of tool args, with long values truncated."""
+    parts = []
+    for k, v in args.items():
+        v_str = str(v)
+        if len(v_str) > 50:
+            v_str = v_str[:49] + "…"
+        parts.append(f"{k}={v_str}")
+    return ", ".join(parts)
+
+
+class BotEngine:
+    def __init__(
+        self,
+        cfg: Dict[str, Any],
+        bot_key: str,
+        connect_mcp: bool = True,
+        enable_shell: bool = False,
+        auto_confirm: bool = False,
+        allowed_shell_commands: Optional[List[str]] = None,
+    ) -> None:
+        self.cfg = cfg
+        self.bot_key = bot_key
+        self.bot_cfg = cfg["bots"][bot_key]
+        self.model_name = self.bot_cfg.get("model") or cfg.get("default_model")
+        self.mcp_manager = MCPManager()
+        self.tools = ToolRegistry(self.mcp_manager)
+
+        tool_cfg = cfg.get("tools", {})
+
+        # If the caller requests shell, we turn it on and honour the
+        # per-bot auto_confirm / allowed_shell_commands overrides.  When
+        # shell is off the confirm_fn and allowlist are irrelevant.
+        _shell_on = enable_shell or tool_cfg.get("enable_shell", False)
+        _confirm_shell = tool_cfg.get("confirm_before_shell", True)
+        _confirm_fn: Callable[[str], bool] = (lambda _msg: True) if auto_confirm else (lambda _msg: False)
+
+        self.tools.register_builtin(
+            enable_filesystem=tool_cfg.get("enable_filesystem", True),
+            enable_shell=_shell_on,
+            enable_http=tool_cfg.get("enable_http", True),
+            confirm_before_write=auto_confirm or tool_cfg.get("confirm_before_write", True),
+            confirm_before_shell=_confirm_shell,
+            confirm_fn=_confirm_fn,
+            allowed_shell_commands=allowed_shell_commands,
+        )
+        if connect_mcp:
+            servers = cfgmod.load_mcp_servers()
+            if servers:
+                self.mcp_manager.connect_all(servers, quiet=True)
+
+        self._sessions: Dict[str, Session] = {}
+
+    # -- session management -------------------------------------------------
+
+    def _new_session(self) -> Session:
+        provider = build_provider(self.model_name, self.cfg)
+        return Session(provider=provider, system_prompt=self.cfg.get("default_system_prompt", ""), tools=self.tools)
+
+    def session_for(self, chat_id: str) -> Session:
+        if chat_id not in self._sessions:
+            self._sessions[chat_id] = self._new_session()
+        return self._sessions[chat_id]
+
+    def is_owner(self, user_id: Any) -> bool:
+        owner = self.bot_cfg.get("owner_id")
+        return owner is None or str(owner) == str(user_id)
+
+    # -- commands -------------------------------------------------------------
+
+    def handle_command(self, chat_id: str, user_id: Any, text: str) -> Optional[str]:
+        """Returns a reply if `text` was a recognized command, else None (caller should treat as normal message)."""
+        stripped = text.strip()
+        if not stripped.startswith("/"):
+            return None
+
+        parts = stripped[1:].split(maxsplit=1)
+        cmd = parts[0].lower().split("@")[0]
+        arg = parts[1].strip() if len(parts) > 1 else ""
+
+        if cmd in ("start", "help"):
+            return HELP_TEXT
+        if cmd == "reset":
+            self._sessions.pop(chat_id, None)
+            return "Conversation cleared."
+        if cmd == "model":
+            if not arg:
+                return f"Current model: {self.model_name}"
+            if not self.is_owner(user_id):
+                return "Only the bot owner can switch models."
+            if arg not in self.cfg.get("models", {}):
+                return f"Unknown model '{arg}'. Known: {', '.join(self.cfg.get('models', {}))}"
+            self.model_name = arg
+            self._sessions.pop(chat_id, None)
+            return f"Switched to {arg}."
+        if cmd == "system":
+            session = self.session_for(chat_id)
+            if not arg:
+                return f"Current system prompt:\n{session.system_prompt}"
+            if not self.is_owner(user_id):
+                return "Only the bot owner can change the system prompt."
+            session.system_prompt = arg
+            return "System prompt updated for this chat."
+        if cmd == "tools":
+            names = self.tools.names()
+            return "Available tools:\n" + "\n".join(f"- {n}" for n in names) if names else "No tools enabled."
+        if cmd == "usage":
+            s = self.session_for(chat_id).stats
+            return f"turns: {s.turns}\ninput tokens: {s.total_input_tokens}\noutput tokens: {s.total_output_tokens}"
+        if cmd in ("whoami", "id"):
+            return f"your id: {user_id}\nchat id: {chat_id}"
+        return f"Unknown command /{cmd}. Try /help."
+
+    # -- normal messages ----------------------------------------------------
+
+    def reply(self, chat_id: str, text: str) -> str:
+        """Runs one full AI turn (tool calls included) and returns the final text."""
+        return self.reply_with_log(chat_id, text)
+
+    def reply_with_log(
+        self,
+        chat_id: str,
+        text: str,
+        stream: bool = False,
+        on_text: Optional[Any] = None,
+    ) -> str:
+        """
+        Runs one full AI turn with tool-call logging. If stream is True,
+        text deltas are passed to on_text as they arrive.
+        Returns the final message text including the tool log footer.
+        """
+        session = self.session_for(chat_id)
+        buffer = {"text": ""}
+
+        def _on_text(chunk: str) -> None:
+            buffer["text"] += chunk
+            if on_text:
+                on_text(chunk)
+
+        turn_log = TurnLog()
+
+        # Track pending tool calls so we can measure duration
+        pending: List[dict] = []
+
+        def on_tool_call(name: str, args: dict) -> None:
+            pending.append({"name": name, "args": args, "start": time.monotonic()})
+
+        def on_tool_result(name: str, output: str, is_error: bool) -> None:
+            # Match the result to the most recent pending call with the same name
+            # (tools run sequentially within a batch, so FIFO is safe)
+            start = time.monotonic()
+            matched = None
+            for i in range(len(pending) - 1, -1, -1):
+                if pending[i]["name"] == name:
+                    matched = pending.pop(i)
+                    break
+            if matched:
+                duration = start - matched["start"]
+            else:
+                duration = 0.0
+            turn_log.add_call(name, matched["args"] if matched else {}, output, is_error, duration)
+
+        try:
+            session.run_turn(text, _on_text, on_tool_call, on_tool_result, stream=stream)
+        except ProviderError as e:
+            return f"Error talking to the model: {e}"
+
+        turn_log.finished_at = time.time()
+
+        footer = turn_log.format_log()
+        body = buffer["text"].strip() or "(no response)"
+        if footer:
+            return f"{body}\n{footer}"
+        return body
+
+    def close(self) -> None:
+        self.mcp_manager.disconnect_all()

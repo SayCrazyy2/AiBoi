@@ -1,0 +1,364 @@
+You are modifying an existing Python project.
+
+Project files
+
+ai_cli/
+└── bots/
+    ├── common.py
+    └── telegram_bot.py
+
+These are the only files that need to be modified unless absolutely necessary.
+
+---
+
+Objective
+
+Replace the current Telegram Bot API implementation with a Telethon-based native Telegram Rich Draft streaming implementation.
+
+The goal is to make the bot behave like ChatGPT inside Telegram.
+
+The current implementation is not true streaming.
+
+It waits until the LLM finishes generating, then sends the message.
+
+Instead, the bot should stream the response while it is being generated using Telegram's native Rich Draft API.
+
+---
+
+Existing problems
+
+The current implementation:
+
+- uses HTTP Bot API
+- uses "sendMessage"
+- uses "editMessageText"
+- uses "sendChatAction"
+- waits until generation finishes
+- cannot show Telegram's native streaming animation
+- sometimes ends up showing "(no response)" because nothing was streamed into the output buffer
+
+This architecture should be replaced.
+
+---
+
+New architecture
+
+Use Telethon instead of the Telegram Bot API.
+
+Do NOT use:
+
+sendMessage
+editMessageText
+sendChatAction
+requests.post(...)
+
+Instead create a Telethon client and use Telegram's MTProto API.
+
+---
+
+Rich Draft streaming
+
+Streaming should work using Rich Message Drafts.
+
+The implementation should follow this flow.
+
+Step 1
+
+Generate a random draft id.
+
+Equivalent to:
+
+draft_id = abs(helpers.generate_random_long())
+
+---
+
+Step 2
+
+Immediately create a Rich Draft.
+
+Use:
+
+functions.messages.SetTypingRequest(
+    peer=chat,
+    action=types.InputSendMessageRichMessageDraftAction(
+        random_id=draft_id,
+        rich_message=types.InputRichMessageHTML(...)
+    )
+)
+
+---
+
+Step 3
+
+Show an animated Thinking state.
+
+Cycle between HTML drafts every ~0.8 seconds.
+
+Example HTML:
+
+<tg-thinking>
+<tg-emoji emoji-id="5573473356579078196">🔍</tg-emoji>
+Searching...
+</tg-thinking>
+
+Then
+
+<tg-thinking>
+<tg-emoji emoji-id="5573473356579078196">🧠</tg-emoji>
+Analyzing...
+</tg-thinking>
+
+Then
+
+<tg-thinking>
+<tg-emoji emoji-id="5573473356579078196">✍️</tg-emoji>
+Writing...
+</tg-thinking>
+
+Repeat until the first generated token arrives.
+
+---
+
+Streaming the response
+
+Do NOT generate the entire response first.
+
+Instead use the streaming callback from the LLM.
+
+"BotEngine.reply_with_log()" already supports streaming.
+
+Call it like:
+
+engine.reply_with_log(
+    chat_id,
+    prompt,
+    stream=True,
+    on_text=callback
+)
+
+Every time "callback(chunk)" is called:
+
+append the chunk to an accumulated buffer.
+
+Approximately every 300–500ms update the Rich Draft.
+
+Example:
+
+functions.messages.SetTypingRequest(
+    peer=chat,
+    action=types.InputSendMessageRichMessageDraftAction(
+        random_id=draft_id,
+        rich_message=types.InputRichMessageMarkdown(
+            markdown=current_text
+        )
+    )
+)
+
+Do NOT update Telegram on every token.
+
+Throttle updates.
+
+---
+
+Streaming strategy
+
+Maintain
+
+current_text = ""
+
+Each callback:
+
+current_text += chunk
+
+Every 300–500ms:
+
+update the draft using
+
+InputRichMessageMarkdown(markdown=current_text)
+
+This produces smooth streaming without flooding Telegram.
+
+---
+
+Final message
+
+When generation completes:
+
+send the final message using
+
+functions.messages.SendMessageRequest(
+    peer=peer,
+    random_id=helpers.generate_random_long(),
+    message=current_text[:4000],
+    rich_message=types.InputRichMessageMarkdown(
+        markdown=current_text
+    )
+)
+
+The draft should naturally disappear once the final message is sent.
+
+---
+
+Group chats
+
+In groups, rich drafts are not appropriate.
+
+Instead:
+
+1. Send a placeholder message such as
+
+Thinking...
+
+2. Stream by editing the message repeatedly.
+
+Equivalent to:
+
+functions.messages.EditMessageRequest(
+    peer=peer,
+    id=message.id,
+    message=current_text,
+    rich_message=types.InputRichMessageMarkdown(
+        markdown=current_text
+    )
+)
+
+3. Perform one final edit after generation completes.
+
+---
+
+Markdown
+
+Do NOT use Telegram MarkdownV2 escaping.
+
+Do NOT strip formatting.
+
+Use Rich Markdown.
+
+Formatting should support:
+
+- headings
+- bold
+- italic
+- inline code
+- fenced code blocks
+- block quotes
+- nested quotes
+- spoilers
+- inline links
+- mentions
+- custom emoji
+- tables where supported
+- horizontal rules
+
+The formatting should remain intact while streaming.
+
+---
+
+common.py
+
+Currently the bot eventually does something similar to
+
+reply = engine.reply(...)
+
+which waits until completion.
+
+Instead it must use
+
+reply_with_log(
+    stream=True,
+    on_text=...
+)
+
+The callback must receive generated chunks and forward them immediately to the Telegram transport.
+
+---
+
+"(no response)" bug
+
+Currently the code ends with something like
+
+buffer["text"].strip() or "(no response)"
+
+The streaming callback should continuously populate the buffer.
+
+"(no response)" should only appear if the provider actually returns zero output.
+
+It must never happen because streaming wasn't wired correctly.
+
+---
+
+Tool log footer
+
+Do not remove or break the existing tool logging.
+
+The footer generated by "common.py" should continue to work.
+
+After generation finishes:
+
+append the footer to the completed response before sending/editing the final message.
+
+---
+
+Error handling
+
+If streaming fails:
+
+- cancel the draft
+- send a normal completed message
+
+If Rich Drafts are unavailable:
+
+- fall back to standard Telethon message sending
+
+Never lose the response.
+
+---
+
+Performance
+
+Throttle draft updates to roughly
+
+300–500ms
+
+Do not send MTProto requests on every token.
+
+---
+
+Preserve existing functionality
+
+Do not break:
+
+- sessions
+- MCP
+- tool registry
+- conversation history
+- model switching
+- system prompt commands
+- usage statistics
+- permissions
+- existing commands
+
+Only replace the Telegram transport layer and integrate true streaming.
+
+---
+
+Expected behaviour
+
+Private chat:
+
+1. User sends message.
+2. Rich Draft immediately appears.
+3. Animated Thinking state cycles.
+4. As the LLM generates text, the draft updates live.
+5. Rich Markdown formatting is preserved throughout generation.
+6. When generation completes, the final rich message is sent.
+7. Tool log footer is included.
+8. Draft disappears.
+
+Group chat:
+
+1. Send "Thinking..." placeholder.
+2. Stream by editing the message.
+3. Final edit contains the completed response.
+
+The implementation should be production quality, cleanly integrated into the existing architecture, and use Telethon's MTProto APIs instead of the Bot API wherever appropriate.
