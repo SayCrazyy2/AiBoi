@@ -21,6 +21,7 @@ APP_DIR = Path(os.environ.get("AI_CLI_HOME", Path.home() / ".ai-cli"))
 CONFIG_PATH = APP_DIR / "config.yaml"
 MCP_SERVERS_PATH = APP_DIR / "mcp_servers.json"
 SESSIONS_DIR = APP_DIR / "sessions"
+CUSTOM_TOOLS_DIR = APP_DIR / "custom_tools"
 
 # Placeholder paths that ship in the example config — replaced at load
 # time with sensible defaults so MCP servers work out of the box.
@@ -100,8 +101,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "enable_shell": False,          # shell exec is off by default -- opt in
         "enable_filesystem": True,
         "enable_http": True,
+        "enable_tool_creator": False,   # tool creation is off by default -- opt in
         "confirm_before_write": True,
         "confirm_before_shell": True,
+        "confirm_before_tool_creator": True,
     },
     "ui": {
         "stream": True,
@@ -341,6 +344,7 @@ def config_from_env(base: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     cfg["tools"]["enable_filesystem"] = _env_bool("AI_ENABLE_FILESYSTEM", cfg["tools"]["enable_filesystem"])
     cfg["tools"]["enable_http"] = _env_bool("AI_ENABLE_HTTP", cfg["tools"]["enable_http"])
     cfg["tools"]["enable_shell"] = _env_bool("AI_ENABLE_SHELL", cfg["tools"]["enable_shell"])
+    cfg["tools"]["enable_tool_creator"] = _env_bool("AI_ENABLE_TOOL_CREATOR", cfg["tools"].get("enable_tool_creator", False))
 
     if os.environ.get("TELEGRAM_BOT_TOKEN"):
         tg = cfg["bots"]["telegram"]

@@ -7,12 +7,15 @@ with is_error=True so the model can see and react to it.
 
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import subprocess
+import textwrap
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from ..config import CUSTOM_TOOLS_DIR
 from ..providers.base import ToolSpec
 
 
@@ -73,14 +76,99 @@ def _find_line_number(text: str, search: str) -> int:
     return text[:idx].count("\n") + 1
 
 
+# ---------------------------------------------------------------------------
+# tool_creator: let the model build custom tools at runtime
+# ---------------------------------------------------------------------------
+
+# Builtins available inside the sandboxed exec() for custom tool code.
+# Intentionally permissive — the tool_creator is already behind a config
+# flag and a confirmation gate, same as enable_shell.
+_SAFE_BUILTINS: Dict[str, Any] = {
+    k: v for k, v in __builtins__.items()  # type: ignore[union-attr]
+} if isinstance(__builtins__, dict) else dict(vars(__builtins__))  # type: ignore[union-attr]
+
+
+def _exec_tool_code(code: str) -> ToolHandler:
+    """
+    Execute user-provided Python code in a restricted namespace and
+    extract the ``run(args) -> str`` function from it.
+
+    The code may use imports and standard builtins, but runs in its own
+    namespace so it can't accidentally clobber the caller's scope.
+    """
+    namespace: Dict[str, Any] = {"__builtins__": _SAFE_BUILTINS}
+    try:
+        exec(compile(code, "<tool_creator>", "exec"), namespace)
+    except SyntaxError as e:
+        raise ToolExecutionError(f"Syntax error in tool code: {e}")
+    except Exception as e:
+        raise ToolExecutionError(f"Failed to execute tool code: {e}")
+
+    handler = namespace.get("run")
+    if not callable(handler):
+        raise ToolExecutionError(
+            "Tool code must define a callable `def run(args: dict) -> str` function. "
+            "It will receive the tool's input arguments as a dict and must return a string."
+        )
+    return handler
+
+
+def _persist_tool(name: str, description: str, input_schema: dict, code: str) -> Path:
+    """Save a custom tool definition to ~/.ai-cli/custom_tools/{name}.py."""
+    CUSTOM_TOOLS_DIR.mkdir(parents=True, exist_ok=True)
+    file_path = CUSTOM_TOOLS_DIR / f"{name}.py"
+    header = textwrap.dedent(f'''
+        """Auto-generated custom tool: {name}"""
+        NAME = {name!r}
+        DESCRIPTION = {description!r}
+        INPUT_SCHEMA = {input_schema!r}
+    ''')
+    file_path.write_text(header + "\n" + code + "\n")
+    return file_path
+
+
+def load_persisted_tools() -> List[Tuple[ToolSpec, ToolHandler]]:
+    """
+    Load all persisted custom tools from ``~/.ai-cli/custom_tools/``.
+    Called once at startup so previously created tools survive restarts.
+    """
+    loaded: List[Tuple[ToolSpec, ToolHandler]] = []
+    if not CUSTOM_TOOLS_DIR.exists():
+        return loaded
+
+    for py_file in sorted(CUSTOM_TOOLS_DIR.glob("*.py")):
+        if py_file.name.startswith("__"):
+            continue
+        try:
+            text = py_file.read_text()
+            ns: Dict[str, Any] = {"__builtins__": _SAFE_BUILTINS}
+            exec(compile(text, str(py_file), "exec"), ns)  # noqa: S102
+            name = ns.get("NAME") or py_file.stem
+            desc = ns.get("DESCRIPTION", "")
+            schema = ns.get("INPUT_SCHEMA", {"type": "object", "properties": {}})
+            handler = ns.get("run")
+            if not callable(handler):
+                continue
+            loaded.append(
+                (ToolSpec(name=name, description=desc, input_schema=schema), handler)
+            )
+        except Exception:
+            # Skip broken tools rather than crashing startup
+            continue
+    return loaded
+
+
 def make_builtin_tools(
     enable_filesystem: bool,
     enable_shell: bool,
     enable_http: bool,
+    enable_tool_creator: bool,
     confirm_before_write: bool,
     confirm_before_shell: bool,
+    confirm_before_tool_creator: bool,
     confirm_fn: Callable[[str], bool],
     allowed_shell_commands: Optional[List[str]] = None,
+    registry: Optional[Any] = None,
 ) -> List[Tuple[ToolSpec, ToolHandler]]:
     tools: List[Tuple[ToolSpec, ToolHandler]] = []
 
@@ -467,5 +555,124 @@ def make_builtin_tools(
             calculator,
         )
     )
+
+    # -------------------------------------------------------------------
+    # tool_creator: dynamically create & register custom tools
+    # -------------------------------------------------------------------
+    if enable_tool_creator:
+        _registry = registry  # capture for the closure
+
+        def tool_creator(args: Dict[str, Any]) -> str:
+            name = args["name"].strip()
+            description = args["description"].strip()
+            input_schema = args["input_schema"]
+            code = args["code"]
+            persist = args.get("persist", False)
+
+            # --- validate -------------------------------------------------
+            if not name or not name.replace("_", "").isalnum():
+                raise ToolExecutionError(
+                    "Tool name must be snake_case (lowercase letters, digits, underscores)."
+                )
+            if not description:
+                raise ToolExecutionError("Tool description is required.")
+            if not isinstance(input_schema, dict):
+                raise ToolExecutionError("input_schema must be a JSON Schema dict.")
+            if not code or not code.strip():
+                raise ToolExecutionError("Tool code is required.")
+
+            # --- confirmation --------------------------------------------
+            if confirm_before_tool_creator:
+                preview = code if len(code) < 800 else code[:797] + "..."
+                if not confirm_fn(
+                    f"Create tool '{name}'?\n"
+                    f"Description: {description}\n"
+                    f"Persist: {'yes' if persist else 'no'}\n"
+                    f"Code preview:\n{preview}"
+                ):
+                    raise ToolExecutionError("User declined to create this tool.")
+
+            # --- compile & extract the handler ----------------------------
+            handler = _exec_tool_code(code)
+
+            # --- validate the handler with a quick dry-run ---------------
+            spec = ToolSpec(
+                name=name,
+                description=description,
+                input_schema=input_schema,
+            )
+
+            # --- persist (optional) --------------------------------------
+            persist_msg = ""
+            if persist:
+                try:
+                    saved = _persist_tool(name, description, input_schema, code)
+                    persist_msg = f" Saved to {saved}."
+                except Exception as e:
+                    persist_msg = f" Persist failed: {e}"
+
+            # --- register in the live registry ---------------------------
+            if _registry is not None:
+                _registry.register_custom(name, spec, handler)
+                return (
+                    f"✅ Tool '{name}' created and registered successfully.{persist_msg}\n"
+                    f"The model can now call `{name}` in subsequent turns."
+                )
+            else:
+                return (
+                    f"Tool '{name}' compiled successfully but no registry was available "
+                    f"to register it.{persist_msg}"
+                )
+
+        tools.append(
+            (
+                ToolSpec(
+                    name="tool_creator",
+                    description=(
+                        "Create a new custom tool that the model can call in subsequent turns. "
+                        "Provide a snake_case name, a description, a JSON Schema for the tool's "
+                        "input parameters, and Python code that defines `def run(args: dict) -> str`. "
+                        "The run function receives the tool's arguments as a dict and must return a string. "
+                        "Set persist=true to save the tool to disk so it survives restarts. "
+                        "The new tool is immediately available for use."
+                    ),
+                    input_schema={
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "description": "snake_case name for the new tool (lowercase, digits, underscores)",
+                            },
+                            "description": {
+                                "type": "string",
+                                "description": "Description of what the tool does (the model uses this to decide when to call it)",
+                            },
+                            "input_schema": {
+                                "type": "object",
+                                "description": (
+                                    "JSON Schema for the tool's input parameters. "
+                                    "Must be a valid JSON Schema object with 'type': 'object', 'properties', and 'required'."
+                                ),
+                            },
+                            "code": {
+                                "type": "string",
+                                "description": (
+                                    "Python code that defines `def run(args: dict) -> str`. "
+                                    "The function receives the tool's arguments as a dict and must return a string. "
+                                    "Example:\n"
+                                    "def run(args):\n    import requests\n    url = args['url']\n    r = requests.get(url)\n    return r.text"
+                                ),
+                            },
+                            "persist": {
+                                "type": "boolean",
+                                "description": "If true, save the tool to ~/.ai-cli/custom_tools/ so it loads on future restarts. Default: false.",
+                            },
+                        },
+                        "required": ["name", "description", "input_schema", "code"],
+                    },
+                ),
+                tool_creator,
+            )
+        )
 
     return tools

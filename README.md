@@ -5,7 +5,7 @@ A terminal AI assistant with:
 - **Multi-model support** — Anthropic (Claude), OpenAI (GPT), local models via Ollama, and third-party OpenAI-compatible providers (OpenRouter, Groq, Together, DeepSeek, Gemini's OpenAI endpoint, or any custom one) behind a single provider interface. Switch models mid-conversation with `/model <name>`.
 - **MCP support** — connects to any [Model Context Protocol](https://modelcontextprotocol.io) server (filesystem, GitHub, fetch, your own, ...) over stdio and exposes their tools to the model automatically. Browse and install servers with `ai mcp`.
 - **MCP server manager** — `ai mcp list` shows a curated catalog of 16 servers, `ai mcp add <name>` installs one interactively (prompts for paths/keys, pre-downloads the package), `ai mcp remove <name>` removes it, `ai mcp install <name>` pre-caches a package, and `ai mcp add-custom` lets you add any server not in the catalog.
-- **Tool calling** — one normalized tool-calling loop that works the same way across every provider, with built-in tools (file read/write, list directory, HTTP GET, calculator, optional shell exec) plus anything your MCP servers add.
+- **Tool calling** — one normalized tool-calling loop that works the same way across every provider, with built-in tools (file read/write/edit, list directory, HTTP GET, calculator, optional shell exec and AI tool creation) plus anything your MCP servers add.
 - **Tool-call logging** — bot messages include a footer showing which tools were called, their arguments, results (truncated), success/error status, duration, and an MCP server breakdown. The session tracks per-tool-call timing.
 - **Bots** — host the assistant as a Telegram and/or Discord bot, so it's one tap away on your phone. Same tool-calling engine, same models, its own per-chat conversation memory and slash commands. Telegram messages use MarkdownV2 formatting with thinking indicators.
 - **Setup wizard** — first time you run `ai` (or any time with `ai --setup`), a guided walkthrough picks a provider, stores keys safely, sets tool permissions, and optionally configures bots. No manual YAML editing required.
@@ -84,7 +84,7 @@ ai
 The first time it finds no config, it launches a setup wizard that:
 
 1. Lists providers (Anthropic, OpenAI, OpenRouter, Groq, Together, DeepSeek, Ollama) and asks which one to use by default, prompting for that provider's API key if it isn't already in your environment. Keys are saved to `~/.ai-cli/.env` (created with `chmod 600`), never written into `config.yaml`.
-2. Asks about tool permissions (filesystem, HTTP, shell — shell defaults to off).
+2. Asks about tool permissions (filesystem, HTTP, shell, tool creation — shell and tool creation default to off).
 3. Optionally walks through Telegram and/or Discord bot setup.
 
 Re-run it any time with:
@@ -301,10 +301,17 @@ shortest example) and register it in `ai_cli/providers/__init__.py`'s
 
 - `enable_shell` is **off by default** — turn it on in `config.yaml` (or say
   yes during the wizard) if you want the assistant to run shell commands.
-- File writes and shell commands prompt for confirmation by default in the
-  REPL/CLI (`confirm_before_write` / `confirm_before_shell`); bots never get
-  shell access and never get to skip the write confirmation, so writes are
-  simply unconfirmable there and blocked.
+- `enable_tool_creator` is **off by default** — turn it on to let the AI
+  create custom tools at runtime. When enabled, the AI can define new tools
+  (with Python code) that are immediately available for use. Set
+  `persist: true` when creating a tool to save it to `~/.ai-cli/custom_tools/`
+  so it loads automatically on future restarts. Tool creation prompts for
+  confirmation by default (`confirm_before_tool_creator`).
+- File writes, shell commands, and tool creation prompt for confirmation by
+  default in the REPL/CLI (`confirm_before_write` / `confirm_before_shell` /
+  `confirm_before_tool_creator`); bots never get shell access and never get to
+  skip the write confirmation, so writes are simply unconfirmable there and
+  blocked.
 
 ## Project layout
 
@@ -326,7 +333,7 @@ ai_cli/
     client.py               stdio JSON-RPC client for a single MCP server
     manager.py               connects multiple servers, namespaces their tools
   tools/
-    builtin.py                read_file, write_file, list_directory, run_shell_command, http_get, calculator
+    builtin.py                read_file, write_file, edit_file, list_directory, run_shell_command, http_get, calculator, tool_creator
     registry.py                merges builtin + MCP tools into one toolbox
   bots/
     common.py                 BotEngine: shared per-chat sessions + slash commands + tool-call log

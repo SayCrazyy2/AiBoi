@@ -87,8 +87,10 @@ tools:
   enable_filesystem: true
   enable_http: true
   enable_shell: false          # opt in explicitly -- runs real shell commands
+  enable_tool_creator: false # opt in to let the AI create custom tools at runtime
   confirm_before_write: true
   confirm_before_shell: true
+  confirm_before_tool_creator: true  # prompt before creating/registering a new tool
 
 ui:
   stream: true

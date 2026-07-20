@@ -409,12 +409,14 @@ def cmd_add_custom(console: Console) -> int:
 
 MCP_USAGE = (
     "Usage:\n"
-    "  ai mcp list               show all available MCP servers (catalog)\n"
-    "  ai mcp installed           show servers in your config\n"
-    "  ai mcp add <name>          add a server from the catalog (interactive)\n"
-    "  ai mcp add-custom          add a custom server not in the catalog\n"
-    "  ai mcp remove <name>       remove a server from your config\n"
-    "  ai mcp install <name>      pre-download a server package"
+    "  ai mcp list              show all available MCP servers (catalog)\n"
+    "  ai mcp installed         show servers currently in your config\n"
+    "  ai mcp add <name>        add a server from the catalog (interactive)\n"
+    "  ai mcp add-custom         add a custom server not in the catalog\n"
+    "  ai mcp remove <name>     remove a server from your config\n"
+    "  ai mcp install <name>    pre-download a server package\n"
+    "\n"
+    "  ai mcp --help            show this help"
 )
 
 

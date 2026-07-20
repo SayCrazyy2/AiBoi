@@ -83,6 +83,7 @@ def run_setup_wizard(console: Console = None) -> Dict[str, Any]:
     cfg["tools"]["enable_filesystem"] = Confirm.ask("Allow reading/writing local files?", default=True)
     cfg["tools"]["enable_http"] = Confirm.ask("Allow HTTP GET requests?", default=True)
     cfg["tools"]["enable_shell"] = Confirm.ask("Allow running shell commands? (powerful, be careful)", default=False)
+    cfg["tools"]["enable_tool_creator"] = Confirm.ask("Allow AI to create custom tools at runtime? (powerful, be careful)", default=False)
 
     # -- 3. bots ---------------------------------------------------------------
     console.print("\n[bold]Step 3 -- bots (optional)[/bold]")

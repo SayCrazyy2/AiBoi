@@ -4,7 +4,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from ..mcp.manager import MCPManager
 from ..providers.base import ToolSpec
-from .builtin import ToolExecutionError, ToolHandler, make_builtin_tools
+from .builtin import ToolExecutionError, ToolHandler, load_persisted_tools, make_builtin_tools
 
 
 class ToolRegistry:
@@ -27,15 +27,24 @@ class ToolRegistry:
         confirm_before_shell: bool,
         confirm_fn: Callable[[str], bool],
         allowed_shell_commands: Optional[List[str]] = None,
+        enable_tool_creator: bool = False,
+        confirm_before_tool_creator: bool = True,
     ) -> None:
+        # Load any tools persisted to ~/.ai-cli/custom_tools/ from prior sessions
+        for spec, handler in load_persisted_tools():
+            self._local[spec.name] = (spec, handler)
+
         for spec, handler in make_builtin_tools(
             enable_filesystem,
             enable_shell,
             enable_http,
+            enable_tool_creator,
             confirm_before_write,
             confirm_before_shell,
+            confirm_before_tool_creator,
             confirm_fn,
             allowed_shell_commands=allowed_shell_commands,
+            registry=self,
         ):
             self._local[spec.name] = (spec, handler)
 

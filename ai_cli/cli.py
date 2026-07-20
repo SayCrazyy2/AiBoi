@@ -18,23 +18,26 @@ from .tools.registry import ToolRegistry
 
 BOTS_USAGE = (
     "Usage:\n"
-    "  ai bots setup [telegram|discord]   interactive token/permissions setup\n"
-    "  ai bots run   [telegram|discord|all]   start a bot (blocks until Ctrl+C)\n"
-    "  ai bots status                     show which bots are configured"
+    "  ai bots setup [telegram|discord|all]   interactive token/permissions setup\n"
+    "  ai bots run    [telegram|discord|all]   start a bot (blocks until Ctrl+C)\n"
+    "  ai bots status                        show which bots are configured"
 )
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="ai",
-        description="A multi-model, MCP-aware, tool-calling AI assistant for your terminal.",
+        description="🤖 A multi-model, MCP-aware, tool-calling AI assistant for your terminal.",
         epilog=(
             "Also available:\n"
-            "  ai setup                run the interactive setup wizard\n"
-            "  ai bots setup|run ...   configure and run Telegram/Discord bots\n"
-            "  ai mcp list|add|remove   manage MCP servers\n"
-            "  ai serve                production entrypoint (Railway/Docker/systemd)\n"
-            "See README.md for details."
+            "  ai setup                  run the interactive setup wizard\n"
+            "  ai bots setup|run|status   configure and run Telegram/Discord bots\n"
+            "  ai mcp list|add|remove|install   manage MCP servers\n"
+            "  ai serve                  production entrypoint (Railway/Docker/systemd)\n"
+            "\n"
+            "  ai --version              show version and exit\n"
+            "\n"
+            "See README.md for full documentation."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -50,6 +53,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--init", action="store_true", help="Write a bare default config to ~/.ai-cli and exit (no prompts).")
     p.add_argument("--setup", action="store_true", help="Run the interactive setup wizard.")
     p.add_argument("--load", metavar="NAME", help="Load a saved session before starting.")
+    p.add_argument("--version", action="store_true", help="Show version and exit.")
     return p
 
 
@@ -78,6 +82,12 @@ def main(argv=None) -> int:
         return handle_mcp(console, argv[1:])
 
     args = build_arg_parser().parse_args(argv)
+
+    if args.version:
+        from . import __version__
+
+        console.print(f"[bold cyan]ai-cli-assistant[/bold cyan] v[green]{__version__}[/green]")
+        return 0
 
     if args.init:
         cfgmod.write_default_config_if_missing()
@@ -155,6 +165,8 @@ def _run_one_shot(console: Console, cfg, model_name: str, prompt: str, args) -> 
         confirm_before_write=tool_cfg.get("confirm_before_write", True),
         confirm_before_shell=tool_cfg.get("confirm_before_shell", True),
         confirm_fn=lambda msg: _cli_confirm(console, msg),
+        enable_tool_creator=tool_cfg.get("enable_tool_creator", False),
+        confirm_before_tool_creator=tool_cfg.get("confirm_before_tool_creator", True),
     )
     if not args.no_mcp:
         servers = cfgmod.load_mcp_servers(args.mcp_config)
@@ -185,11 +197,12 @@ def _run_one_shot(console: Console, cfg, model_name: str, prompt: str, args) -> 
             console.print(chunk, end="")
 
     def on_tool_call(name: str, tool_args: dict) -> None:
-        console.print(f"[yellow]-> {name}[/yellow]({tool_args})", file=sys.stderr)
+        console.print(f"[yellow]🔧 → calling[/yellow] [bold]{name}[/bold]({tool_args})", file=sys.stderr)
 
     def on_tool_result(name: str, output: str, is_error: bool) -> None:
         color = "red" if is_error else "green"
-        console.print(f"[{color}]<- {name}[/{color}]", file=sys.stderr)
+        icon = "❌" if is_error else "✅"
+        console.print(f"  [{color}]{icon} {name}[/{color}]", file=sys.stderr)
 
     try:
         session.run_turn(prompt, on_text, on_tool_call, on_tool_result, stream=stream)

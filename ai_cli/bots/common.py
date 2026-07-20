@@ -17,14 +17,26 @@ from ..session import Session
 from ..tools.registry import ToolRegistry
 
 HELP_TEXT = (
-    "Here's what I can do:\n"
-    "/help - show this message\n"
-    "/reset - clear this chat's conversation history\n"
-    "/model [name] - show or switch the model (owner only to change)\n"
-    "/system [prompt] - show or set the system prompt for this chat (owner only to change)\n"
-    "/tools - list available tools\n"
-    "/usage - token usage for this chat\n"
-    "/whoami - show your user id and this chat's id\n"
+    "🤖 **AI CLI Assistant** — Here's what I can do:\n"
+    "\n"
+    "**📋 Commands**\n"
+    "/help — show this message\n"
+    "/reset — clear conversation history\n"
+    "/model [name] — show or switch model (owner only)\n"
+    "/models — list all configured models\n"
+    "/system [prompt] — show or set system prompt (owner only)\n"
+    "/tools — list available tools\n"
+    "/mcp — list connected MCP servers\n"
+    "/usage — token usage for this chat\n"
+    "/count — message count for this chat\n"
+    "/info — session info (model, tools, usage)\n"
+    "/history — show recent messages (truncated)\n"
+    "/retry — re-send your last message\n"
+    "/compact — summarize & compact conversation to save tokens\n"
+    "/export [txt|json|md] — export conversation\n"
+    "/time — show current time and session stats\n"
+    "/version — show version info\n"
+    "/whoami — show your user id and this chat's id\n"
     "\n"
     "📎 **File & Media Support**:\n"
     "- Send photos, documents, videos, audio — I'll analyze them\n"
@@ -88,6 +100,10 @@ class TurnLog:
         > ```
         > 442.0
         > ```
+        >
+        > 📦 MCP: filesystem (1), calculator (1)
+        >
+        > ⏱ Total elapsed: 4.1s
         """
         if not self.tool_calls:
             return ""
@@ -99,7 +115,8 @@ class TurnLog:
 
         # Header line
         total_elapsed = self.elapsed
-        lines.append(f"> **🔧 Tool Calls** · {len(self.tool_calls)} call{'s' if len(self.tool_calls) != 1 else ''} · {total_elapsed:.1f}s")
+        n = len(self.tool_calls)
+        lines.append(f"> **🔧 Tool Calls** · {n} call{'s' if n != 1 else ''} · {total_elapsed:.1f}s")
         lines.append(">")
 
         for tc in self.tool_calls:
@@ -145,6 +162,16 @@ class TurnLog:
             if servers_used:
                 srv_summary = ", ".join(f"{k} ({v})" for k, v in servers_used.items())
                 lines.append(f"> 📦 MCP: {srv_summary}")
+                lines.append(">")
+
+        # Summary stats line
+        success_count = sum(1 for tc in self.tool_calls if not tc.is_error)
+        error_count = n - success_count
+        stats_parts = [f"✅ {success_count}"]
+        if error_count:
+            stats_parts.append(f"❌ {error_count}")
+        stats_parts.append(f"⏱ {total_elapsed:.1f}s")
+        lines.append(f"> {' · '.join(stats_parts)}")
 
         return "\n".join(lines)
 
@@ -201,6 +228,8 @@ class BotEngine:
             confirm_before_shell=_confirm_shell,
             confirm_fn=_confirm_fn,
             allowed_shell_commands=allowed_shell_commands,
+            enable_tool_creator=tool_cfg.get("enable_tool_creator", False),
+            confirm_before_tool_creator=tool_cfg.get("confirm_before_tool_creator", True),
         )
 
         # Register send_file tool if a callback was provided (e.g. by Telegram bot)
@@ -285,7 +314,7 @@ class BotEngine:
             return HELP_TEXT
         if cmd == "reset":
             self._sessions.pop(chat_id, None)
-            return "Conversation cleared."
+            return "✅ Conversation cleared."
         if cmd == "model":
             if not arg:
                 return f"Current model: {self.model_name}"
@@ -295,23 +324,222 @@ class BotEngine:
                 return f"Unknown model '{arg}'. Known: {', '.join(self.cfg.get('models', {}))}"
             self.model_name = arg
             self._sessions.pop(chat_id, None)
-            return f"Switched to {arg}."
+            return f"✅ Switched to {arg}."
+        if cmd == "models":
+            models = self.cfg.get("models", {})
+            if not models:
+                return "No models configured."
+            lines = ["**Configured models:**"]
+            for name, spec in models.items():
+                marker = "★" if name == self.model_name else "○"
+                lines.append(f"  {marker} `{name}` ({spec['provider']}: {spec['model']})")
+            return "\n".join(lines)
         if cmd == "system":
             session = self.session_for(chat_id)
             if not arg:
-                return f"Current system prompt:\n{session.system_prompt}"
+                return f"Current system prompt:\n{session.system_prompt or '(empty)'}"
             if not self.is_owner(user_id):
                 return "Only the bot owner can change the system prompt."
             session.system_prompt = arg
-            return "System prompt updated for this chat."
+            return "✅ System prompt updated for this chat."
         if cmd == "tools":
             names = self.tools.names()
-            return "Available tools:\n" + "\n".join(f"- {n}" for n in names) if names else "No tools enabled."
+            if not names:
+                return "No tools enabled."
+            # Group by source
+            builtin = [n for n in names if not n.startswith("mcp__")]
+            mcp = [n for n in names if n.startswith("mcp__")]
+            lines = [f"**Available tools** ({len(names)} total)"]
+            if builtin:
+                lines.append(f"\n**Built-in** ({len(builtin)}):")
+                lines.extend(f"  • `{n}`" for n in builtin)
+            if mcp:
+                lines.append(f"\n**MCP** ({len(mcp)}):")
+                lines.extend(f"  • `{n}`" for n in mcp)
+            return "\n".join(lines)
+        if cmd == "mcp":
+            server_names = self.mcp_manager.list_server_names()
+            if not server_names:
+                return "No MCP servers connected."
+            mcp_specs = [s for s in self.tools.all_specs() if s.name.startswith("mcp__")]
+            lines = [f"**Connected MCP servers** ({len(server_names)})"]
+            for name in server_names:
+                tool_count = sum(1 for s in mcp_specs if s.name.split("__")[1] == name)
+                lines.append(f"  • `{name}` — {tool_count} tools")
+            return "\n".join(lines)
         if cmd == "usage":
             s = self.session_for(chat_id).stats
-            return f"turns: {s.turns}\ninput tokens: {s.total_input_tokens}\noutput tokens: {s.total_output_tokens}"
+            return (
+                f"**Token usage**\n"
+                f"  turns: {s.turns}\n"
+                f"  input tokens: {s.total_input_tokens:,}\n"
+                f"  output tokens: {s.total_output_tokens:,}\n"
+                f"  total: {s.total_input_tokens + s.total_output_tokens:,}"
+            )
+        if cmd == "count":
+            session = self.session_for(chat_id)
+            return f"Messages in this chat: {len(session.messages)}"
+        if cmd == "info":
+            session = self.session_for(chat_id)
+            s = session.stats
+            tool_count = len(self.tools.names())
+            mcp_count = len(self.mcp_manager.list_server_names())
+            return (
+                f"**Session info**\n"
+                f"  model: {self.model_name} ({session.provider.name})\n"
+                f"  tools: {tool_count} ({mcp_count} MCP servers)\n"
+                f"  messages: {len(session.messages)}\n"
+                f"  turns: {s.turns}\n"
+                f"  tokens: {s.total_input_tokens + s.total_output_tokens:,}"
+            )
         if cmd in ("whoami", "id"):
             return f"your id: {user_id}\nchat id: {chat_id}"
+        if cmd == "history":
+            session = self.session_for(chat_id)
+            msgs = session.messages
+            if not msgs:
+                return "No messages yet."
+            lines = [f"**💬 Conversation History** ({len(msgs)} messages)"]
+            for i, msg in enumerate(msgs[-20:], 1):  # last 20
+                role = msg.get("role", "?")
+                content = msg.get("content", "")
+                if isinstance(content, list):
+                    text_parts = []
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            text_parts.append(block["text"])
+                        elif isinstance(block, dict) and block.get("type") == "tool_use":
+                            text_parts.append(f"[🔧 {block.get('name', '?')}]")
+                    text = " ".join(text_parts)
+                elif isinstance(content, str):
+                    text = content
+                else:
+                    text = str(content)
+                if len(text) > 150:
+                    text = text[:147] + "..."
+                role_label = {"user": "🧑 user", "assistant": "🤖 assistant"}.get(role, role)
+                lines.append(f"  {i}. **{role_label}**: {text}")
+            return "\n".join(lines[-40:])  # cap output
+        if cmd == "retry":
+            session = self.session_for(chat_id)
+            last_user_text = None
+            for msg in reversed(session.messages):
+                if msg.get("role") == "user":
+                    content = msg.get("content", "")
+                    if isinstance(content, list):
+                        for block in content:
+                            if isinstance(block, dict) and block.get("type") == "text":
+                                last_user_text = block["text"]
+                                break
+                    elif isinstance(content, str):
+                        last_user_text = content
+                    if last_user_text:
+                        break
+            if not last_user_text:
+                return "⚠️ No previous message to retry."
+            # Remove last user msg + any assistant response after it
+            while session.messages:
+                last = session.messages[-1]
+                if last.get("role") == "user":
+                    session.messages.pop()
+                    break
+                session.messages.pop()
+            return self.reply_with_log(chat_id, last_user_text)
+        if cmd == "compact":
+            session = self.session_for(chat_id)
+            msgs = session.messages
+            if len(msgs) < 6:
+                return "⚠️ Not enough messages to compact (need at least 6)."
+            to_summarize = msgs[:-2]
+            keep = msgs[-2:]
+            summary_parts = []
+            for msg in to_summarize:
+                role = msg.get("role", "?")
+                content = msg.get("content", "")
+                if isinstance(content, list):
+                    text_parts = []
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            text_parts.append(block["text"])
+                        elif isinstance(block, dict) and block.get("type") == "tool_use":
+                            text_parts.append(f"[tool: {block.get('name', '?')}]")
+                    text = " ".join(text_parts)
+                elif isinstance(content, str):
+                    text = content
+                else:
+                    text = str(content)
+                if len(text) > 150:
+                    text = text[:147] + "..."
+                summary_parts.append(f"{role}: {text}")
+            summary = "\n".join(summary_parts)
+            compact_msg = {
+                "role": "user",
+                "content": [{"type": "text", "text": f"[Previous conversation summary — {len(to_summarize)} messages compacted]\n{summary}"}],
+            }
+            session.messages = [compact_msg] + keep
+            return f"✅ Compacted {len(to_summarize)} messages into 1 summary. ({len(session.messages)} messages now)"
+        if cmd == "export":
+            session = self.session_for(chat_id)
+            fmt = arg or "txt"
+            if fmt not in ("txt", "json", "md", "markdown"):
+                return "⚠️ Format must be: txt, json, or md"
+            if not session.messages:
+                return "⚠️ No messages to export."
+            import time as _time
+            import json as _json
+            timestamp = _time.strftime("%Y%m%d_%H%M%S")
+            if fmt == "json":
+                return f"```\n{_json.dumps(session.to_dict(), indent=2)}\n```"
+            elif fmt in ("md", "markdown"):
+                lines = [f"# Conversation Export\n\n_Exported: {_time.strftime('%Y-%m-%d %H:%M:%S')}_\n_Model: {self.model_name}_\n\n---"]
+                for msg in session.messages:
+                    role = msg.get("role", "?")
+                    content = msg.get("content", "")
+                    if isinstance(content, list):
+                        text_parts = []
+                        for block in content:
+                            if isinstance(block, dict) and block.get("type") == "text":
+                                text_parts.append(block["text"])
+                        text = "\n".join(text_parts)
+                    elif isinstance(content, str):
+                        text = content
+                    else:
+                        text = str(content)
+                    role_label = {"user": "🧑 User", "assistant": "🤖 Assistant"}.get(role, role)
+                    lines.append(f"\n### {role_label}\n\n{text}\n")
+                return "\n".join(lines)
+            else:
+                lines = []
+                for msg in session.messages:
+                    role = msg.get("role", "?")
+                    content = msg.get("content", "")
+                    if isinstance(content, list):
+                        text_parts = []
+                        for block in content:
+                            if isinstance(block, dict) and block.get("type") == "text":
+                                text_parts.append(block["text"])
+                        text = " ".join(text_parts)
+                    elif isinstance(content, str):
+                        text = content
+                    else:
+                        text = str(content)
+                    lines.append(f"[{role}] {text}")
+                return "\n".join(lines)
+        if cmd == "time":
+            import time as _time
+            session = self.session_for(chat_id)
+            s = session.stats
+            now = _time.strftime("%Y-%m-%d %H:%M:%S")
+            return (
+                f"**⏱ Session Time**\n"
+                f"  current: {now}\n"
+                f"  messages: {len(session.messages)}\n"
+                f"  turns: {s.turns}\n"
+                f"  total tokens: {s.total_input_tokens + s.total_output_tokens:,}"
+            )
+        if cmd == "version":
+            from .. import __version__
+            return f"🤖 ai-cli-assistant v{__version__}"
         return f"Unknown command /{cmd}. Try /help."
 
     # -- normal messages ----------------------------------------------------

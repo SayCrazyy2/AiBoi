@@ -11,7 +11,7 @@ from .providers.base import CompletionResult, Provider, ProviderError, StreamEve
 from .tools.builtin import ToolExecutionError
 from .tools.registry import ToolRegistry
 
-MAX_TOOL_ITERATIONS = 10  # guard against infinite tool-call loops
+MAX_TOOL_ITERATIONS = 20  # guard against infinite tool-call loops
 
 
 @dataclass
