@@ -39,6 +39,10 @@ class Session:
     def _append_user_text(self, text: str) -> None:
         self.messages.append({"role": "user", "content": [{"type": "text", "text": text}]})
 
+    def _append_user_message(self, content: List[Dict[str, Any]]) -> None:
+        """Append a user message with arbitrary content blocks (text, image, etc.)."""
+        self.messages.append({"role": "user", "content": content})
+
     def run_turn(
         self,
         user_text: str,
@@ -46,13 +50,20 @@ class Session:
         on_tool_call: Callable[[str, dict], None],
         on_tool_result: Callable[[str, str, bool], None],
         stream: bool = True,
+        content_blocks: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """
         Runs one full turn: send the user's message, let the model call
         tools as many times as it needs (up to MAX_TOOL_ITERATIONS), and
         stop once it produces a final text answer.
+
+        If *content_blocks* is provided, they replace the plain-text user
+        message (used for multimodal input — images, files, etc.).
         """
-        self._append_user_text(user_text)
+        if content_blocks:
+            self._append_user_message(content_blocks)
+        else:
+            self._append_user_text(user_text)
         specs = self.tools.all_specs()
 
         for _ in range(MAX_TOOL_ITERATIONS):

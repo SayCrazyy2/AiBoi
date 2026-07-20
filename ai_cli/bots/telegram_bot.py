@@ -14,10 +14,12 @@ https://my.telegram.org for MTProto.
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import os
 import random
 import time
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from telethon import TelegramClient, events
@@ -31,7 +33,35 @@ from .common import BotEngine
 logger = logging.getLogger(__name__)
 
 MAX_MESSAGE_LEN = 4000
-STREAM_UPDATE_INTERVAL = 0.45
+STREAM_UPDATE_INTERVAL = 0.30
+
+# Directory for downloaded media from users
+MEDIA_DIR = Path(os.environ.get("AI_CLI_HOME", Path.home() / ".ai-cli")) / "downloads"
+MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+
+# Max image size to inline as base64 (5 MB)
+_MAX_INLINE_IMAGE_SIZE = 5 * 1024 * 1024
+
+# MIME types for text-based files we can read and include in the prompt
+_TEXT_MIME_TYPES = {
+    "text/plain", "text/markdown", "text/html", "text/css", "text/javascript",
+    "application/json", "application/xml", "application/x-yaml",
+    "text/x-python", "text/x-shellscript",
+}
+
+# File extensions for text-based files
+_TEXT_EXTENSIONS = {
+    ".txt", ".md", ".markdown", ".html", ".css", ".js", ".mjs", ".json",
+    ".xml", ".yaml", ".yml", ".py", ".sh", ".bash", ".rb", ".go", ".rs",
+    ".c", ".cpp", ".h", ".hpp", ".java", ".kt", ".swift", ".ts", ".tsx",
+    ".jsx", ".vue", ".svelte", ".sql", ".toml", ".ini", ".cfg", ".conf",
+    ".log", ".csv", ".tsv", ".env",
+}
+
+# Image MIME types we can send as vision content
+_IMAGE_MIME_TYPES = {
+    "image/jpeg", "image/png", "image/gif", "image/webp",
+}
 
 # Telegram's random_id must fit in a signed 64-bit integer
 _INT64_MAX = 2**63 - 1
@@ -181,39 +211,47 @@ def _random_id() -> int:
 class RichDraftManager:
     """Manages Rich Draft state for private chat streaming."""
 
-    _icons = ["🔍", "🧠", "✍️", "💭", "⚡"]
+    _icons = ["🔍", "🧠", "✍️", "📝", "👣", "🤖", "🗣", "🛠", "⚡"]
+    _icon_ids = ["5535365052359507996", "5537230721728380949", "5534951812081123354", "5537247356136718385", "5535039193190760468", "5537515087218081814", "5537354996607090745", "5537560399123054610", "5573333417954639880"]
+
+    def _create_thinking_html(eid, emoji: str, text: str) -> str:
+        """Create HTML thinking animation."""
+        return f"<tg-thinking>\n<tg-emoji emoji-id=\"{eid}\">{emoji}</tg-emoji>\n{text}</tg-thinking>"
+
+    # Built once at class-definition time so _cycle_thinking doesn't
+    # rebuild the list on every call.
+    _thinking_htmls = [
+        _create_thinking_html(_icon_ids[0], _icons[0], "Searching..."),
+        _create_thinking_html(_icon_ids[1], _icons[1], "Analyzing..."),
+        _create_thinking_html(_icon_ids[2], _icons[2], "Writing..."),
+        _create_thinking_html(_icon_ids[3], _icons[3], "Coding..."),
+        _create_thinking_html(_icon_ids[4], _icons[4], "Walking..."),
+        _create_thinking_html(_icon_ids[5], _icons[5], "Boting"),
+        _create_thinking_html(_icon_ids[6], _icons[6], "Talking with Coworks..."),
+        _create_thinking_html(_icon_ids[7], _icons[7], "Fixing..."),
+        _create_thinking_html(_icon_ids[8], _icons[8], "Thinking..."),
+    ]
 
     def __init__(self, client: TelegramClient):
         self.client = client
         self.draft_id: Optional[int] = None
         self._update_interval = STREAM_UPDATE_INTERVAL
 
-    def _create_thinking_html(self, emoji: str, text: str) -> str:
-        """Create HTML thinking animation."""
-        return f"<tg-thinking>\n<tg-emoji emoji-id=\"5573473356579078196\">{emoji}</tg-emoji>\n{text}</tg-thinking>"
-
     async def _cycle_thinking(self, peer) -> None:
-        """Cycle through thinking states before real content arrives."""
-        thinking_htmls = [
-            self._create_thinking_html(self._icons[0], "Searching..."),
-            self._create_thinking_html(self._icons[1], "Analyzing..."),
-            self._create_thinking_html(self._icons[2], "Writing..."),
-        ]
-
-        for thinking_html in thinking_htmls:
-            try:
-                await self.client(
-                    messages.SetTypingRequest(
-                        peer=peer,
-                        action=types.InputSendMessageRichMessageDraftAction(
-                            random_id=_random_id(),
-                            rich_message=types.InputRichMessageHTML(html=thinking_html),
-                        ),
-                    )
+        """Pick one random thinking state and keep it until real content arrives."""
+        thinking_html = random.choice(self._thinking_htmls)
+        try:
+            await self.client(
+                messages.SetTypingRequest(
+                    peer=peer,
+                    action=types.InputSendMessageRichMessageDraftAction(
+                        random_id=_random_id(),
+                        rich_message=types.InputRichMessageHTML(html=thinking_html),
+                    ),
                 )
-            except Exception:
-                pass
-            await asyncio.sleep(0.8)
+            )
+        except Exception as e:
+            print(e)
 
     async def start_draft(self, peer) -> Optional[int]:
         """Start a Rich Draft for private chat."""
@@ -275,19 +313,30 @@ class TelegramBot:
         # The allowlist can be customised via TELEGRAM_SHELL_ALLOWLIST.
         allowlist = _resolve_allowlist()
 
+        # --- send_file callback ------------------------------------------
+        # The closure captures `self` so it can access the Telethon client
+        # and event loop, which are set later in _run_async().  The tool
+        # handler runs in a worker thread, so we use run_coroutine_threadsafe
+        # to schedule the async send_file on the main event loop.
+        def _on_send_file(path: str, caption: str) -> None:
+            self._do_send_file(path, caption)
+
         self.engine = BotEngine(
             cfg,
             "telegram",
-            connect_mcp=False,
+            connect_mcp=True,
             enable_shell=True,
             auto_confirm=True,
             allowed_shell_commands=allowlist,
+            on_send_file=_on_send_file,
         )
 
         self._api_id_int = api_id_int
         self._api_hash = api_hash
         self._bot_token = bot_token
         self._client: Optional[TelegramClient] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._current_chat_id: Optional[str] = None
 
     def run(self) -> None:
         asyncio.run(self._run_async())
@@ -317,6 +366,9 @@ class TelegramBot:
                 self._handle_event, events.NewMessage(incoming=True)
             )
 
+            # Capture the event loop for cross-thread file sending
+            self._loop = asyncio.get_running_loop()
+
             await self._client.run_until_disconnected()
         except KeyboardInterrupt:
             logger.info("[telethon] stopped.")
@@ -338,23 +390,239 @@ class TelegramBot:
         chat_id = str(message.chat.id)
         user_id = str(message.sender_id)
         text = message.text or ""
+        caption = message.message or ""  # caption is the text accompanying media
+
+        # Track the current chat id so _do_send_file knows where to send
+        self._current_chat_id = chat_id
 
         logger.debug("Message from %s: %s", chat_id, text[:80])
 
-        reply = self.engine.handle_command(chat_id, user_id, text)
+        # Check if the message has media (photo, document, video, audio, voice)
+        has_media = bool(message.photo or message.document or message.video
+                         or message.voice or message.audio or message.gif
+                         or message.sticker or message.video_note)
+
+        reply = self.engine.handle_command(chat_id, user_id, text or caption)
         if reply is None:
-            await self._handle_message(event, chat_id, text)
+            if has_media:
+                await self._handle_media_message(event, chat_id, caption)
+            else:
+                await self._handle_message(event, chat_id, text)
         elif reply:
             await self._send_message(event.chat, reply)
 
-    async def _handle_message(self, event, chat_id: str, text: str) -> None:
+    # -- media handling (receiving files) -----------------------------------
+
+    async def _handle_media_message(self, event, chat_id: str, caption: str) -> None:
+        """Download media from the message and pass it to the AI engine."""
+        message = event.message
+        media_info = self._describe_media(message)
+        logger.info("Received media: %s", media_info["summary"])
+
+        # Download the media to MEDIA_DIR
+        try:
+            file_path = await message.download_media(file=str(MEDIA_DIR))
+        except Exception as e:
+            logger.error(f"Failed to download media: {e}")
+            await self._send_message(event.chat, f"❌ Failed to download media: {e}")
+            return
+
+        if not file_path:
+            await self._send_message(event.chat, "❌ Could not download the attached media.")
+            return
+
+        file_path = Path(file_path)
+        content_blocks: List[Dict[str, Any]] = []
+        prompt_parts: List[str] = []
+
+        # Build the text prompt describing the file
+        prompt_parts.append(f"📎 **File received**: `{file_path.name}`")
+        prompt_parts.append(f"- **Path**: `{file_path}`")
+        prompt_parts.append(f"- **Size**: {media_info['size_display']}")
+        prompt_parts.append(f"- **Type**: {media_info['media_type']}")
+        if media_info.get("mime_type"):
+            prompt_parts.append(f"- **MIME**: {media_info['mime_type']}")
+        if caption:
+            prompt_parts.append(f"\n**User instruction**: {caption}")
+        else:
+            prompt_parts.append("\n*No caption provided. Analyze this file.*")
+
+        # For images, try to inline as base64 for vision models
+        is_image = media_info["media_type"] == "image" or (
+            file_path.suffix.lower() in {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+        )
+
+        if is_image and file_path.stat().st_size <= _MAX_INLINE_IMAGE_SIZE:
+            try:
+                img_data = file_path.read_bytes()
+                img_b64 = base64.b64encode(img_data).decode("utf-8")
+                # Determine MIME type
+                suffix = file_path.suffix.lower()
+                mime_map = {".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                            ".png": "image/png", ".gif": "image/gif",
+                            ".webp": "image/webp"}
+                mime_type = mime_map.get(suffix, media_info.get("mime_type", "image/jpeg"))
+                content_blocks.append({
+                    "type": "image",
+                    "media_type": mime_type,
+                    "data": img_b64,
+                })
+                prompt_parts.append("\n*(Image attached for visual analysis)*")
+            except Exception as e:
+                logger.warning(f"Could not inline image: {e}")
+                prompt_parts.append(f"\n*(Image saved at {file_path} — use read_file if needed)*")
+
+        # For text-based files, read the content and include in the prompt
+        elif self._is_text_file(file_path, media_info.get("mime_type")):
+            try:
+                text_content = file_path.read_text(errors="replace")
+                if len(text_content) > 30000:
+                    text_content = text_content[:30000] + "\n...[truncated]"
+                prompt_parts.append(f"\n**File contents:**\n```\n{text_content}\n```")
+            except Exception as e:
+                logger.warning(f"Could not read text file: {e}")
+                prompt_parts.append(f"\n*(File saved at {file_path} — use read_file tool to access)*")
+
+        else:
+            prompt_parts.append(f"\n*(File saved at `{file_path}` — use read_file or run_shell_command tools to access it)*")
+
+        # Build the full text block
+        full_prompt = "\n".join(prompt_parts)
+        content_blocks.insert(0, {"type": "text", "text": full_prompt})
+
+        # Now process through the engine with the content blocks
         is_private = chat_id.isdigit() and int(chat_id) > 0
         if is_private:
-            await self._handle_private_chat(event, text)
+            await self._handle_private_chat(event, full_prompt, content_blocks)
         else:
-            await self._handle_group_chat(event, text)
+            await self._handle_group_chat(event, full_prompt, content_blocks)
 
-    async def _handle_private_chat(self, event, text: str) -> None:
+    def _describe_media(self, message) -> Dict[str, Any]:
+        """Extract metadata from a Telethon message with media."""
+        info: Dict[str, Any] = {"summary": "unknown", "media_type": "file", "mime_type": "", "size_display": "unknown"}
+
+        if message.photo:
+            info["media_type"] = "image"
+            info["summary"] = "photo"
+            info["mime_type"] = "image/jpeg"
+            # Try to get the largest photo size
+            sizes = message.photo.sizes if hasattr(message.photo, "sizes") else []
+            if sizes:
+                largest = sizes[-1] if isinstance(sizes, list) else sizes
+                if hasattr(largest, "size"):
+                    size = largest.size
+                    info["size_display"] = f"{size / 1024:.1f} KB"
+            return info
+
+        if message.document:
+            doc = message.document
+            mime_type = doc.mime_type or ""
+            info["mime_type"] = mime_type
+            size = doc.size or 0
+            info["size_display"] = f"{size / (1024*1024):.2f} MB" if size >= 1024*1024 else f"{size / 1024:.1f} KB"
+
+            if mime_type.startswith("image/"):
+                info["media_type"] = "image"
+            elif mime_type.startswith("video/"):
+                info["media_type"] = "video"
+            elif mime_type.startswith("audio/"):
+                info["media_type"] = "audio"
+            else:
+                info["media_type"] = "document"
+
+            # Try to get filename from attributes
+            for attr in doc.attributes:
+                if hasattr(attr, "file_name") and attr.file_name:
+                    info["summary"] = attr.file_name
+                    break
+            if info["summary"] == "unknown":
+                info["summary"] = f"{info['media_type']} ({mime_type or 'unknown'})"
+            return info
+
+        if message.video:
+            info["media_type"] = "video"
+            info["summary"] = "video"
+            info["mime_type"] = "video/mp4"
+            return info
+
+        if message.voice:
+            info["media_type"] = "voice"
+            info["summary"] = "voice message"
+            info["mime_type"] = "audio/ogg"
+            return info
+
+        if message.audio:
+            info["media_type"] = "audio"
+            info["summary"] = "audio"
+            return info
+
+        if message.sticker:
+            info["media_type"] = "sticker"
+            info["summary"] = "sticker"
+            return info
+
+        if message.gif:
+            info["media_type"] = "gif"
+            info["summary"] = "gif"
+            return info
+
+        return info
+
+    def _is_text_file(self, file_path: Path, mime_type: str = "") -> bool:
+        """Check if a file is text-based and can be read as text."""
+        if mime_type in _TEXT_MIME_TYPES:
+            return True
+        if file_path.suffix.lower() in _TEXT_EXTENSIONS:
+            return True
+        # Fallback: try to detect by reading first few bytes
+        try:
+            with open(file_path, "rb") as f:
+                chunk = f.read(1024)
+            return b"\x00" not in chunk  # binary files usually have null bytes
+        except Exception:
+            return False
+
+    # -- file sending (AI sends files to user) ------------------------------
+
+    def _do_send_file(self, path: str, caption: str) -> None:
+        """
+        Called by the send_file tool handler (running in a worker thread).
+        Schedules the async file send on the main event loop and blocks
+        until it completes.
+        """
+        if not self._client or not self._loop:
+            raise RuntimeError("Telegram client not connected")
+
+        chat_id = self._current_chat_id
+        if not chat_id:
+            raise RuntimeError("No active chat to send file to")
+
+        file_path = Path(path).expanduser().resolve()
+        if not file_path.exists():
+            raise FileNotFoundError(f"File not found: {file_path}")
+
+        future = asyncio.run_coroutine_threadsafe(
+            self._client.send_file(
+                int(chat_id),
+                str(file_path),
+                caption=caption or None,
+            ),
+            self._loop,
+        )
+        # Block until the file is sent (with a timeout)
+        try:
+            future.result(timeout=60)
+        except Exception as e:
+            raise RuntimeError(f"Failed to send file: {e}")
+
+    async def _handle_message(self, event, chat_id: str, text: str, content_blocks: Optional[List[Dict[str, Any]]] = None) -> None:
+        is_private = chat_id.isdigit() and int(chat_id) > 0
+        if is_private:
+            await self._handle_private_chat(event, text, content_blocks)
+        else:
+            await self._handle_group_chat(event, text, content_blocks)
+
+    async def _handle_private_chat(self, event, text: str, content_blocks: Optional[List[Dict[str, Any]]] = None) -> None:
         """Handle private chat with Rich Draft streaming."""
         peer = event.chat
         loop = asyncio.get_running_loop()
@@ -371,9 +639,6 @@ class TelegramBot:
             now = time.time()
             if now - last_update >= STREAM_UPDATE_INTERVAL:
                 last_update = now
-                # We're in a worker thread — schedule the coroutine on the
-                # main event loop, not asyncio.ensure_future (which needs a
-                # loop in the current thread).
                 asyncio.run_coroutine_threadsafe(
                     draft_mgr.update_draft(peer, current_text), loop
                 )
@@ -384,13 +649,14 @@ class TelegramBot:
             text,
             True,
             on_text,
+            content_blocks,
         )
 
         success = await draft_mgr.finish_draft(peer, final_text)
         if not success:
             await self._send_message(peer, final_text)
 
-    async def _handle_group_chat(self, event, text: str) -> None:
+    async def _handle_group_chat(self, event, text: str, content_blocks: Optional[List[Dict[str, Any]]] = None) -> None:
         """Handle group chat with message editing (no Rich Drafts)."""
         peer = event.chat
         loop = asyncio.get_running_loop()
@@ -415,6 +681,7 @@ class TelegramBot:
             text,
             True,
             on_text,
+            content_blocks,
         )
 
         await self._edit_message(msg, final_text)

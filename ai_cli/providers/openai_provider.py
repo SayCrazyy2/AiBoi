@@ -51,6 +51,7 @@ class OpenAIProvider(Provider):
         for m in messages:
             role = m["role"]
             text_parts = [b["text"] for b in m["content"] if b["type"] == "text"]
+            image_parts = [b for b in m["content"] if b["type"] == "image"]
             tool_uses = [b for b in m["content"] if b["type"] == "tool_use"]
             tool_results = [b for b in m["content"] if b["type"] == "tool_result"]
 
@@ -74,6 +75,15 @@ class OpenAIProvider(Provider):
                             "content": tr["content"],
                         }
                     )
+            elif image_parts:
+                # Build multimodal content for OpenAI vision API
+                content_parts: List[Dict[str, Any]] = []
+                for tp in text_parts:
+                    content_parts.append({"type": "text", "text": tp})
+                for ip in image_parts:
+                    data_uri = f"data:{ip['media_type']};base64,{ip['data']}"
+                    content_parts.append({"type": "image_url", "image_url": {"url": data_uri}})
+                out.append({"role": role, "content": content_parts})
             else:
                 out.append({"role": role, "content": " ".join(text_parts)})
         return out

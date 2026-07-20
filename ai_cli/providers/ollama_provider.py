@@ -28,6 +28,7 @@ class OllamaProvider(Provider):
         out = [{"role": "system", "content": system}]
         for m in messages:
             text_parts = [b["text"] for b in m["content"] if b["type"] == "text"]
+            image_parts = [b for b in m["content"] if b["type"] == "image"]
             tool_uses = [b for b in m["content"] if b["type"] == "tool_use"]
             tool_results = [b for b in m["content"] if b["type"] == "tool_result"]
             if tool_uses:
@@ -43,6 +44,11 @@ class OllamaProvider(Provider):
             elif tool_results:
                 for tr in tool_results:
                     out.append({"role": "tool", "content": tr["content"]})
+            elif image_parts:
+                # Ollama supports images as base64 strings in the "images" field
+                msg: Dict[str, Any] = {"role": m["role"], "content": " ".join(text_parts)}
+                msg["images"] = [ip["data"] for ip in image_parts]
+                out.append(msg)
             else:
                 out.append({"role": m["role"], "content": " ".join(text_parts)})
         return out

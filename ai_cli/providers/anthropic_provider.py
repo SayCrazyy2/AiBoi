@@ -30,6 +30,18 @@ class AnthropicProvider(Provider):
             for block in m["content"]:
                 if block["type"] == "text":
                     content.append({"type": "text", "text": block["text"]})
+                elif block["type"] == "image":
+                    # Pass image blocks through to Anthropic's API format
+                    content.append(
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": block["media_type"],
+                                "data": block["data"],
+                            },
+                        }
+                    )
                 elif block["type"] == "tool_use":
                     content.append(
                         {

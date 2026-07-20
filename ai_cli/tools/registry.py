@@ -39,6 +39,10 @@ class ToolRegistry:
         ):
             self._local[spec.name] = (spec, handler)
 
+    def register_custom(self, name: str, spec: ToolSpec, handler: ToolHandler) -> None:
+        """Register a single custom tool at runtime (e.g. send_file for bots)."""
+        self._local[name] = (spec, handler)
+
     def set_mcp_manager(self, manager: MCPManager) -> None:
         self._mcp_manager = manager
 

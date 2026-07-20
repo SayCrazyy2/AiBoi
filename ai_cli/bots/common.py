@@ -26,6 +26,13 @@ HELP_TEXT = (
     "/usage - token usage for this chat\n"
     "/whoami - show your user id and this chat's id\n"
     "\n"
+    "📎 **File & Media Support**:\n"
+    "- Send photos, documents, videos, audio — I'll analyze them\n"
+    "- Images are processed with vision (if the model supports it)\n"
+    "- Text files (.txt, .py, .json, .md, ...) are read automatically\n"
+    "- Binary files are saved and accessible via tools\n"
+    "- I can send files back using the send_file tool\n"
+    "\n"
     "Anything else you send is just a normal message to the assistant."
 )
 
@@ -168,6 +175,7 @@ class BotEngine:
         enable_shell: bool = False,
         auto_confirm: bool = False,
         allowed_shell_commands: Optional[List[str]] = None,
+        on_send_file: Optional[Callable[[str, str], None]] = None,
     ) -> None:
         self.cfg = cfg
         self.bot_key = bot_key
@@ -194,12 +202,57 @@ class BotEngine:
             confirm_fn=_confirm_fn,
             allowed_shell_commands=allowed_shell_commands,
         )
+
+        # Register send_file tool if a callback was provided (e.g. by Telegram bot)
+        if on_send_file:
+            self._register_send_file_tool(on_send_file)
+
         if connect_mcp:
             servers = cfgmod.load_mcp_servers()
             if servers:
                 self.mcp_manager.connect_all(servers, quiet=True)
 
         self._sessions: Dict[str, Session] = {}
+
+    def _register_send_file_tool(self, on_send_file: Callable[[str, str], None]) -> None:
+        """Register send_file and send_photo tools that the AI can call to send media to the chat."""
+        from ..providers.base import ToolSpec
+
+        def _send_file(args: Dict[str, Any]) -> str:
+            path = args["path"]
+            caption = args.get("caption", "")
+            try:
+                on_send_file(path, caption)
+                return f"File sent successfully: {path}"
+            except Exception as e:
+                return f"Failed to send file: {e}"
+
+        self.tools.register_custom(
+            "send_file",
+            ToolSpec(
+                name="send_file",
+                description=(
+                    "Send a file from the local filesystem to the user in the chat. "
+                    "Use this to share generated files, documents, images, or any other file. "
+                    "The file will be uploaded and sent as an attachment."
+                ),
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Path to the file to send.",
+                        },
+                        "caption": {
+                            "type": "string",
+                            "description": "Optional caption to include with the file.",
+                        },
+                    },
+                    "required": ["path"],
+                },
+            ),
+            _send_file,
+        )
 
     # -- session management -------------------------------------------------
 
@@ -273,10 +326,13 @@ class BotEngine:
         text: str,
         stream: bool = False,
         on_text: Optional[Any] = None,
+        content_blocks: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         """
         Runs one full AI turn with tool-call logging. If stream is True,
         text deltas are passed to on_text as they arrive.
+        If content_blocks is provided, they replace the plain text user message
+        (used for multimodal input — images, files, etc.).
         Returns the final message text including the tool log footer.
         """
         session = self.session_for(chat_id)
@@ -311,7 +367,7 @@ class BotEngine:
             turn_log.add_call(name, matched["args"] if matched else {}, output, is_error, duration)
 
         try:
-            session.run_turn(text, _on_text, on_tool_call, on_tool_result, stream=stream)
+            session.run_turn(text, _on_text, on_tool_call, on_tool_result, stream=stream, content_blocks=content_blocks)
         except ProviderError as e:
             return f"Error talking to the model: {e}"
 
